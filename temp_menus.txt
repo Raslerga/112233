@@ -1,0 +1,29 @@
+﻿MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(\"оговорить с \"), KeyboardButton(\"аличие и цена\")], 
+        [KeyboardButton(\"формить заказ\"), KeyboardButton(\"изуализация штор\")]
+    ], 
+    resize_keyboard=True
+)
+
+BACK_MENU = ReplyKeyboardMarkup(
+    [[KeyboardButton(\"азад в меню\")]], resize_keyboard=True
+)
+
+ADD_OR_SEND_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton(\"обавить ещё\"), KeyboardButton(\"тправить заказ\")], [KeyboardButton(\"азад в меню\")]], resize_keyboard=True
+)
+
+VISUALIZATION_START_MENU = ReplyKeyboardMarkup(
+    [[KeyboardButton(\"ачать визуализацию\")], [KeyboardButton(\"азад в меню\")]], 
+    resize_keyboard=True
+)
+
+CURTAIN_STYLES_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(\"имские\"), KeyboardButton(\"лассическая 1 штора\")], 
+        [KeyboardButton(\"С ламбрекеном\"), KeyboardButton(\"ве шторы по бокам\")],
+        [KeyboardButton(\"азад в меню\")]
+    ], 
+    resize_keyboard=True
+)
