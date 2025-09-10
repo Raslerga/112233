@@ -1,6 +1,6 @@
 import logging
 from typing import Optional
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputFile
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputFile, BotCommand, MenuButtonCommands, MenuButtonDefault, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 # from telegram.ext import JobQueue
 from telegram.constants import ChatAction
@@ -23,6 +23,59 @@ import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("miranda-bot")
+# Снизим шум от сторонних библиотек
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
+
+async def _set_commands_for_authorized(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    await context.bot.set_my_commands(
+        [
+            BotCommand("start", "Запустить бота"),
+            BotCommand("ai", "Поговорить с ИИ"),
+            BotCommand("inventory", "Наличие и цена"),
+            BotCommand("order", "Оформить заказ"),
+            BotCommand("exit", "Назад в меню"),
+            BotCommand("help", "Помощь"),
+        ],
+        scope=None,
+        language_code=None,
+    )
+    try:
+        await context.bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonCommands())
+    except Exception:
+        pass
+
+
+async def _clear_commands_for_unauthorized(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    await context.bot.set_my_commands(commands=[])
+    try:
+        await context.bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonDefault())
+    except Exception:
+        pass
+
+
+async def _inc_sent(context: ContextTypes.DEFAULT_TYPE, n: int = 1) -> None:
+    stats = context.application.bot_data.setdefault("stats", {"received": 0, "sent": 0})
+    stats["sent"] = int(stats.get("sent", 0)) + n
+
+
+# Хелперы-обёртки
+async def _reply_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    m = await update.effective_message.reply_text(text, **kwargs)
+    await _inc_sent(context)
+    return m
+
+async def _send_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text=text, **kwargs)
+    await _inc_sent(context)
+    return m
+
+async def _reply_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+    m = await update.effective_message.reply_photo(*args, **kwargs)
+    await _inc_sent(context)
+    return m
 
 
 def _to_telegram_jpeg(img_bytes: bytes) -> BytesIO:
@@ -47,27 +100,33 @@ async def _mark_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     app = context.application
     active: dict = app.bot_data.setdefault("active_users", {})
     active[user.id] = {"username": user.username or "", "first_name": user.first_name or "", "last": time.time()}
+    # Учёт статистики полученных сообщений
+    stats = app.bot_data.setdefault("stats", {"received": 0, "sent": 0})
+    stats["received"] = int(stats.get("received", 0)) + 1
     # Троттлинг логирования: не чаще раза в 60 секунд
     now = time.time()
     last_log = app.bot_data.get("active_last_log", 0.0)
     if now - last_log >= 60.0:
         window = 180.0  # 3 минуты
-        online = [f"{uid}:{info.get('username') or info.get('first_name') or ''}" for uid, info in active.items() if now - info.get("last", 0) <= window]
-        if online:
-            logger.info("Онлайн за 3 мин: %d — %s", len(online), ", ".join(online))
-        else:
-            logger.info("Онлайн за 3 мин: 0")
+        online = [uid for uid, info in active.items() if now - info.get("last", 0) <= window]
+        online_count = len(online)
+        sent = int(stats.get("sent", 0))
+        recv = int(stats.get("received", 0))
+        logger.info("status=online active_3m=%d received=%d sent=%d", online_count, recv, sent)
         app.bot_data["active_last_log"] = now
 
 
 INTRO_TEXT = (
     "Здравствуйте! Я — Искусственный интеллект ООО \"Компания Миранда\".\n"
-    "Создан быть помощником для текстильных декораторов и дизайнеров — клиентов компании.\n\n"
-    "Для начала работы отправьте, пожалуйста, ИНН вашей компании для авторизации."
+    "Создан быть помощником для текстильных декораторов и дизайнеров — клиентов компании."
 )
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [[KeyboardButton("Поговорить с ИИ"), KeyboardButton("Наличие и цена")], [KeyboardButton("Оформить заказ")]], resize_keyboard=True
+)
+
+UNAUTH_MENU = ReplyKeyboardMarkup(
+    [[KeyboardButton("Поговорить с ИИ"), KeyboardButton("Авторизация")]], resize_keyboard=True
 )
 
 BACK_MENU = ReplyKeyboardMarkup(
@@ -90,7 +149,11 @@ VIZ_STYLE_KB = ReplyKeyboardMarkup(
 async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Сброс любых режимов и возвращение в главное меню
     context.user_data.clear()
-    await update.effective_message.reply_text("Вы вышли в главное меню.", reply_markup=MAIN_MENU)
+    storage: Storage = context.bot_data["storage"]
+    if storage.is_authorized(update.effective_user.id):
+        await _reply_text(update, context, "Вы вышли в главное меню.", reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.effective_message.reply_text("Вы в меню.", reply_markup=UNAUTH_MENU)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -115,22 +178,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         storage.mark_authorized(user.id, pending.inn, pending.email)
+        # Включаем команды и кнопку «Меню» после успешной авторизации
+        await _set_commands_for_authorized(context, update.effective_chat.id)
         await update.effective_message.reply_text(
             "Авторизация подтверждена! Добро пожаловать. Можете пробовать функции бота.",
-            reply_markup=MAIN_MENU,
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
     # Обычный старт
     storage: Storage = context.bot_data["storage"]
     if storage.is_authorized(user.id):
+        await _set_commands_for_authorized(context, update.effective_chat.id)
         await update.effective_message.reply_text(
-            "Вы уже авторизованы. Можете пробовать функции бота.", reply_markup=MAIN_MENU
+            "Вы уже авторизованы. Можете пробовать функции бота.", reply_markup=ReplyKeyboardRemove()
         )
         return
 
-    context.user_data["awaiting_inn"] = True
-    await update.effective_message.reply_text(INTRO_TEXT)
+    # Неавторизован: очистим команды и покажем два варианта
+    await _clear_commands_for_unauthorized(context, update.effective_chat.id)
+    await update.effective_message.reply_text(
+        INTRO_TEXT + "\n\nВыберите действие:", reply_markup=UNAUTH_MENU
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,26 +207,81 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     settings = get_settings()
     storage: Storage = context.bot_data["storage"]
 
-    # Режим чата с ИИ
+    # Ранняя обработка команд из кнопки «Меню»
+    text_in = (update.effective_message.text or "").strip()
+    low = text_in.lower()
+    if low in {"/ai", "/inventory", "/order", "/exit", "/help"}:
+        if low == "/exit":
+            await cmd_exit(update, context)
+            return
+        if low == "/help":
+            await update.effective_message.reply_text(
+                "Доступные команды:\n/ai — чат с ИИ\n/inventory — наличие и цена\n/order — оформить заказ\n/exit — назад в меню"
+            )
+            return
+        if low == "/ai":
+            ai: Optional[AIClient] = context.bot_data.get("ai_client")
+            if ai is None:
+                await update.effective_message.reply_text("ИИ недоступен.")
+                return
+            context.user_data["chat_with_ai"] = True
+            await update.effective_message.reply_text(
+                "Режим чата с Мирандой. Напишите свой вопрос. Для выхода — /exit или кнопка \"Назад в меню\".",
+                reply_markup=BACK_MENU,
+            )
+            return
+        # inventory/order только для авторизованных
+        if not storage.is_authorized(update.effective_user.id):
+            await update.effective_message.reply_text(
+                "Эта команда доступна после авторизации. Нажмите \"Авторизация\" в меню.",
+                reply_markup=UNAUTH_MENU,
+            )
+            return
+        if low == "/inventory":
+            if context.bot_data.get("inventory") is None:
+                try:
+                    context.bot_data["inventory"] = Inventory(settings.inventory_xml_path, settings.inventory_import_xml_path)
+                except Exception as e:
+                    logger.exception("Inventory load error: %s", e)
+                    await update.effective_message.reply_text("Не удалось загрузить складскую выгрузку.")
+                    return
+            context.user_data["inv_mode"] = True
+            context.user_data["inv_step"] = "await_article"
+            await update.effective_message.reply_text(
+                "Раздел: Наличие и цена. Напишите артикул товара (можно приблизительно).",
+                reply_markup=BACK_MENU,
+            )
+            return
+        if low == "/order":
+            context.user_data["order_mode"] = True
+            context.user_data["order_step"] = "await_article"
+            context.user_data.setdefault("order_items", [])
+            await update.effective_message.reply_text(
+                "Раздел: Оформить заказ. Введите артикул товара.", reply_markup=BACK_MENU
+            )
+            return
+
+    # Режим чата с ИИ (разрешён всем)
     if context.user_data.get("chat_with_ai"):
-        text = (update.effective_message.text or "").strip()
-        if text.lower() in {"/exit", "выйти", "назад", "в меню", "назад в меню"}:
+        text = text_in
+        if text.lower() in {"/exit", "назад", "в меню", "назад в меню"}:
             context.user_data["chat_with_ai"] = False
-            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=MAIN_MENU)
+            if storage.is_authorized(update.effective_user.id):
+                await update.effective_message.reply_text("Вы в главном меню.", reply_markup=ReplyKeyboardRemove())
+            else:
+                await update.effective_message.reply_text("Вы в меню.", reply_markup=UNAUTH_MENU)
             return
         history = storage.get_history(update.effective_user.id, limit=20)
         ai: AIClient = context.bot_data["ai_client"]
         storage.append_history(update.effective_user.id, "user", text)
         thinking = None
         try:
-            # Индикатор печати + временное сообщение
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
             thinking = await update.effective_message.reply_text("Думаю…", reply_markup=BACK_MENU)
             reply = ai.generate(history, text)
             try:
                 await thinking.edit_text(reply)
             except BadRequest:
-                # Если редактирование запрещено, удалим "Думаю…" и отправим новый ответ
                 try:
                     await thinking.delete()
                 except Exception:
@@ -166,7 +290,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             logger.exception("AI error: %s", e)
             reply = "Извините, не удалось получить ответ от ИИ. Попробуйте позже."
-            # Попробуем удалить "Думаю…" если успели отправить
             if thinking is not None:
                 try:
                     await thinking.delete()
@@ -183,10 +306,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.effective_message.reply_text("Склад временно недоступен.")
             context.user_data.clear()
             return
-        user_text = (update.effective_message.text or "").strip()
+        user_text = text_in
         if user_text.lower() in {"/exit", "назад", "в меню", "назад в меню"}:
             context.user_data.clear()
-            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=MAIN_MENU)
+            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=ReplyKeyboardRemove())
             return
         step = context.user_data.get("inv_step")
         if step == "await_article":
@@ -232,7 +355,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 items = inv.by_article.get(key, [])
                 label = ""
                 if items:
-                    # Показать человекочитаемый артикул/название
                     label = items[0].article or items[0].name or key
                 else:
                     label = key
@@ -246,17 +368,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if step == "choose_article":
             choices = context.user_data.get("inv_article_choices", [])
             if not choices:
-                # Перезапросим артикул
                 context.user_data["inv_step"] = "await_article"
                 await update.effective_message.reply_text("Введите артикул товара ещё раз.", reply_markup=BACK_MENU)
                 return
             sel_key = None
+            user_text = (update.effective_message.text or "").strip()
             if user_text.isdigit():
                 idx = int(user_text) - 1
                 if 0 <= idx < len(choices):
                     sel_key = choices[idx]
             if sel_key is None:
-                # Попробуем сопоставить по строке среди подписей
                 try:
                     from rapidfuzz import process, fuzz
                 except Exception:
@@ -298,63 +419,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"Цена за метр: {item.price_per_meter:.2f}\nОстаток: {item.quantity_m:.2f} м"
             )
             context.user_data.clear()
-            await update.effective_message.reply_text("Готово. Вы в главном меню.", reply_markup=MAIN_MENU)
+            await update.effective_message.reply_text("Готово. Вы в главном меню.", reply_markup=ReplyKeyboardRemove())
             return
 
     # Режим «Оформить заказ»
     if context.user_data.get("order_mode"):
-        user_text = (update.effective_message.text or "").strip()
+        user_text = text_in
         if user_text.lower() in {"/exit", "назад", "в меню", "назад в меню"}:
             context.user_data.clear()
-            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=MAIN_MENU)
+            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=ReplyKeyboardRemove())
             return
+
         step = context.user_data.get("order_step")
         storage: Storage = context.bot_data["storage"]
         user_info = storage.get_user(update.effective_user.id) or {}
-        order_email = get_settings().order_to_email
+        order_email = settings.order_to_email
         sender: EmailSender = context.bot_data["email_sender"]
-        # Инициализируем корзину позиций
-        if context.user_data.get("order_items") is None:
-            context.user_data["order_items"] = []
+
+        context.user_data.setdefault("order_items", [])
+
         if step == "await_article":
             context.user_data["order_article"] = user_text
             context.user_data["order_step"] = "await_color"
             await update.effective_message.reply_text("Введите цвет (слово или цифра).", reply_markup=BACK_MENU)
             return
+
         if step == "await_color":
             context.user_data["order_color"] = user_text
             context.user_data["order_step"] = "await_qty"
             await update.effective_message.reply_text("Введите количество (в метрах).", reply_markup=BACK_MENU)
             return
+
         if step == "await_qty":
             context.user_data["order_qty"] = user_text
-            # Доп. поля: ТК и разбивка полотен
-            context.user_data["order_step"] = "await_transport"
-            await update.effective_message.reply_text("Укажите транспортную компанию (например: Деловые линии, ПЭК, СДЭК).", reply_markup=BACK_MENU)
-            return
-        if step == "await_transport":
-            context.user_data["order_transport"] = user_text
             context.user_data["order_step"] = "await_panels"
-            await update.effective_message.reply_text("Разбивка полотен: укажите, например, 'одно полотно' или 'две панели по 1,5 м'.", reply_markup=BACK_MENU)
+            await update.effective_message.reply_text(
+                "Разбивка полотен: укажите, например, 'одно полотно' или 'две панели по 1,5 м'.",
+                reply_markup=BACK_MENU,
+            )
             return
+
         if step == "await_panels":
             context.user_data["order_panels"] = user_text
-            # Сохраняем позицию
             item = {
                 "article": context.user_data.get("order_article", "-"),
                 "color": context.user_data.get("order_color", "-"),
                 "qty": context.user_data.get("order_qty", "-"),
-                "transport": context.user_data.get("order_transport", "-"),
                 "panels": context.user_data.get("order_panels", "одно полотно"),
             }
             context.user_data["order_items"].append(item)
-            # Сброс временных полей позиции
-            for k in ("order_article", "order_color", "order_qty", "order_transport", "order_panels"):
+            for k in ("order_article", "order_color", "order_qty", "order_panels"):
                 context.user_data.pop(k, None)
             context.user_data["order_step"] = "await_add_or_send"
-            # Краткое резюме текущих позиций
             lines = [
-                f"{i+1}) {it['article']} | цвет: {it['color']} | м: {it['qty']} | ТК: {it.get('transport','-')} | полотна: {it.get('panels','-')}"
+                f"{i+1}) {it['article']} | цвет: {it['color']} | м: {it['qty']} | полотна: {it.get('panels','-')}"
                 for i, it in enumerate(context.user_data["order_items"])
             ]
             await update.effective_message.reply_text(
@@ -362,209 +480,90 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=ADD_OR_SEND_KB,
             )
             return
+
         if step == "await_add_or_send":
-            if user_text.lower() in {"добавить ещё", "добавить еще"}:
+            low = user_text.lower()
+            if low in {"добавить ещё", "добавить еще"}:
                 context.user_data["order_step"] = "await_article"
                 await update.effective_message.reply_text("Введите артикул следующей позиции.", reply_markup=BACK_MENU)
                 return
-            if user_text.lower() in {"отправить заказ", "отправить"}:
-                items = context.user_data.get("order_items", [])
-                if not items:
-                    await update.effective_message.reply_text("Нет позиций для отправки. Добавьте хотя бы одну.", reply_markup=BACK_MENU)
-                    return
-                inn = user_info.get("inn", "-")
-                email = user_info.get("email", "-")
-                subject = "Новый заказ из Telegram-бота"
-                body_lines = [
-                    "Поступил новый заказ из бота.",
-                    "",
-                    f"ИНН клиента: {inn}",
-                    f"Email клиента: {email}",
-                    "",
-                    "Позиции:",
-                ]
-                for i, it in enumerate(items, 1):
-                    body_lines.append(
-                        f"{i}) Артикул: {it['article']} | Цвет: {it['color']} | Кол-во (м): {it['qty']} | ТК: {it.get('transport','-')} | полотна: {it.get('panels','одно полотно')}"
-                    )
-                body = "\n".join(body_lines)
-                try:
-                    sender.send_text(order_email, subject, body)
-                    await update.effective_message.reply_text("Заказ отправлен менеджеру. Мы свяжемся с вами.")
-                except Exception as e:
-                    # Покажем краткую причину ошибки пользователю для диагностики
+            if low in {"отправить заказ", "отправить"}:
+                if not context.user_data.get("order_transport"):
+                    context.user_data["order_step"] = "await_transport_final"
                     await update.effective_message.reply_text(
-                        "Не удалось отправить заказ. Проверьте настройки почты (SMTP хост/порт/логин/пароль).\n"
-                        f"Техническая причина: {type(e).__name__}: {e}")
-                context.user_data.clear()
-                await update.effective_message.reply_text("Вы в главном меню.", reply_markup=MAIN_MENU)
-                return
-        # Иначе повторим вопрос
-        await update.effective_message.reply_text("Выберите действие: добавить ещё или отправить заказ.", reply_markup=ADD_OR_SEND_KB)
-        return
+                        "Укажите транспорт: название ТК (Деловые линии, ПЭК, СДЭК), или напишите 'самовывоз' или 'доставка'.",
+                        reply_markup=BACK_MENU,
+                    )
+                    return
+                # если уже указан транспорт — сразу отправляем
+                low = "готово"
+                context.user_data["order_step"] = "await_transport_final"
 
-    # Режим «Визуализация штор»
-    if context.user_data.get("viz_mode"):
-        user_text = (update.effective_message.text or "").strip()
-        if user_text.lower() in {"/exit", "назад", "в меню", "назад в меню"}:
+        if step == "await_transport_final":
+            if user_text.strip():
+                # сохранить при первом вводе
+                if not context.user_data.get("order_transport") and user_text.lower() not in {"готово"}:
+                    context.user_data["order_transport"] = user_text.strip()
+            items = context.user_data.get("order_items", [])
+            if not items:
+                await update.effective_message.reply_text("Нет позиций для отправки. Добавьте хотя бы одну.", reply_markup=BACK_MENU)
+                context.user_data["order_step"] = "await_article"
+                return
+            inn = user_info.get("inn", "-")
+            email = user_info.get("email", "-")
+            subject = "Новый заказ из Telegram-бота"
+            body_lines = [
+                "Поступил новый заказ из бота.",
+                "",
+                f"ИНН клиента: {inn}",
+                f"Email клиента: {email}",
+                f"Доставка/ТК: {context.user_data.get('order_transport','-')}",
+                "",
+                "Позиции:",
+            ]
+            for i, it in enumerate(items, 1):
+                body_lines.append(
+                    f"{i}) Артикул: {it['article']} | Цвет: {it['color']} | Кол-во (м): {it['qty']} | полотна: {it.get('panels','одно полотно')}"
+                )
+            body = "\n".join(body_lines)
+            try:
+                sender.send_text(order_email, subject, body)
+                await update.effective_message.reply_text("Заказ отправлен менеджеру. Мы свяжемся с вами.")
+            except Exception as e:
+                await update.effective_message.reply_text(
+                    "Не удалось отправить заказ. Проверьте настройки почты (SMTP хост/порт/логин/пароль).\n"
+                    f"Техническая причина: {type(e).__name__}: {e}")
             context.user_data.clear()
-            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=MAIN_MENU)
-            return
-        step = context.user_data.get("viz_step")
-        fabric_collection: FabricCollection = context.bot_data.get("fabric_collection")
-        ai: Optional[AIClient] = context.bot_data.get("ai_client")
-        # Шаг выбора стиля
-        if step == "choose_style":
-            mapping = {
-                "римские": "римские",
-                "классическая 1 штора": "классическая",
-                "с ламбрекеном": "ламбрекен",
-                "две шторы по бокам": "две_по_бокам",
-            }
-            key = mapping.get(user_text.lower())
-            if not key:
-                await update.effective_message.reply_text("Пожалуйста, выберите стиль из списка.", reply_markup=VIZ_STYLE_KB)
-                return
-            context.user_data["viz_style"] = key
-            context.user_data["viz_step"] = "await_room_photo"
-            await update.effective_message.reply_text("Отправьте фото комнаты с окном, где будут шторы.", reply_markup=BACK_MENU)
-            return
-        # Шаг артикула
-        if step == "await_article":
-            q = user_text
-            arts = fabric_collection.search_articles(q)
-            if not arts:
-                await update.effective_message.reply_text("Артикул не найден. Введите другое название.", reply_markup=BACK_MENU)
-                return
-            if len(arts) == 1:
-                sel = arts[0]
-                context.user_data["viz_article"] = sel
-                colors = fabric_collection.get_colors(sel)
-                if not colors:
-                    await update.effective_message.reply_text("Для артикула нет цветов.")
-                    return
-                await update.effective_message.reply_text("Введите название цвета. Доступные: " + ", ".join(colors[:20]), reply_markup=BACK_MENU)
-                context.user_data["viz_step"] = "await_color"
-                return
-            # несколько вариантов
-            lines = [f"{i+1}. {a}" for i, a in enumerate(arts[:20])]
-            context.user_data["viz_article_choices"] = arts
-            await update.effective_message.reply_text("Найдено несколько артикулов:\n" + "\n".join(lines) + "\nУкажите номер.", reply_markup=BACK_MENU)
-            context.user_data["viz_step"] = "choose_article"
-            return
-        if step == "choose_article":
-            choices = context.user_data.get("viz_article_choices", [])
-            if user_text.isdigit():
-                idx = int(user_text) - 1
-                if 0 <= idx < len(choices):
-                    sel = choices[idx]
-                    context.user_data["viz_article"] = sel
-                    colors = fabric_collection.get_colors(sel)
-                    await update.effective_message.reply_text("Введите название цвета. Доступные: " + ", ".join(colors[:20]), reply_markup=BACK_MENU)
-                    context.user_data["viz_step"] = "await_color"
-                    return
-            await update.effective_message.reply_text("Пожалуйста, укажите корректный номер.")
-            return
-        # Шаг выбора цвета и генерация
-        if step == "await_color":
-            article = context.user_data.get("viz_article")
-            color_query = user_text
-            colors = fabric_collection.search_colors(article, color_query)
-            if not colors:
-                allc = fabric_collection.get_colors(article)
-                await update.effective_message.reply_text("Цвет не найден. Доступные: " + ", ".join(allc[:20]))
-                return
-            color = colors[0]
-            context.user_data["viz_color"] = color
-            # Обеспечим описание образца (кеш)
-            if not fabric_collection.has_fabric_description(article, color):
-                if ai is None:
-                    await update.effective_message.reply_text("Описание ткани отсутствует и ИИ недоступен для анализа.")
-                    return
-                img_path = fabric_collection.get_fabric_image_path(article, color)
-                if not img_path:
-                    await update.effective_message.reply_text("Файл образца ткани не найден.")
-                    return
-                await update.effective_message.reply_text("Анализирую образец ткани...")
-                desc = ai.analyze_fabric_sample(img_path)
-                fabric_collection.set_fabric_description(article, color, desc)
-            # Собираем промпт и генерируем
-            if ai is None:
-                await update.effective_message.reply_text("Генерация изображений недоступна: не настроен OpenAI API.")
-                return
-            style = context.user_data.get("viz_style")
-            room_desc = context.user_data.get("viz_room_desc", "")
-            fabric_desc = fabric_collection.get_fabric_description(article, color) or ""
-            await update.effective_message.reply_text("Генерирую изображение, подождите...")
-            img_bytes = ai.generate_curtain_visualization(style, room_desc, fabric_desc, article, color)
-            if img_bytes:
-                await update.effective_message.reply_photo(photo=InputFile(BytesIO(img_bytes), filename="visualization.jpg"))
-            else:
-                await update.effective_message.reply_text("Не удалось сгенерировать изображение (DALL·E 2).")
-            context.user_data.clear()
-            await update.effective_message.reply_text("Готово. Вы в главном меню.", reply_markup=MAIN_MENU)
+            await update.effective_message.reply_text("Вы в главном меню.", reply_markup=ReplyKeyboardRemove())
             return
 
-    if storage.is_authorized(update.effective_user.id):
-        txt = (update.effective_message.text or "").strip()
-        if txt == "Поговорить с ИИ":
+
+    # Неавторизованный пользователь: кнопки «Поговорить с ИИ» и «Авторизация»
+    if not storage.is_authorized(update.effective_user.id):
+        txt = text_in
+        if txt == "Поговорить с ИИ" or txt.lower() == "/ai":
             ai: Optional[AIClient] = context.bot_data.get("ai_client")
             if ai is None:
                 await update.effective_message.reply_text(
-                    "Раздел чата с ИИ временно недоступен: не настроен ключ OpenAI. Обратитесь к администратору.",
-                    reply_markup=BACK_MENU,
+                    "Раздел чата с ИИ временно недоступен: не настроен ключ OpenAI.",
+                    reply_markup=UNAUTH_MENU,
                 )
                 return
             context.user_data["chat_with_ai"] = True
             await update.effective_message.reply_text(
-                "Вы перешли в режим чата с Мирандой. Напишите свой вопрос. Для выхода нажмите \"Назад в меню\" или /exit.",
+                "Режим чата с Мирандой. Напишите свой вопрос. Для выхода нажмите \"Назад в меню\" или /exit.",
                 reply_markup=BACK_MENU,
             )
             return
-        if txt == "Наличие и цена":
-            # Подготовим инвентарь при первом обращении
-            if context.bot_data.get("inventory") is None:
-                settings = get_settings()
-                try:
-                    context.bot_data["inventory"] = Inventory(settings.inventory_xml_path, settings.inventory_import_xml_path)
-                except Exception as e:
-                    logger.exception("Inventory load error: %s", e)
-                    await update.effective_message.reply_text("Не удалось загрузить складскую выгрузку.")
-                    return
-            context.user_data["inv_mode"] = True
-            context.user_data["inv_step"] = "await_article"
+        if txt == "Авторизация":
+            context.user_data["awaiting_inn"] = True
             await update.effective_message.reply_text(
-                "Раздел: Наличие и цена. Напишите артикул товара (можно приблизительно, я подскажу варианты).",
-                reply_markup=BACK_MENU,
+                "Для авторизации отправьте ИНН вашей компании.", reply_markup=BACK_MENU
             )
             return
-        if txt == "Оформить заказ":
-            context.user_data["order_mode"] = True
-            context.user_data["order_step"] = "await_article"
-            context.user_data["order_items"] = []
-            await update.effective_message.reply_text(
-                "Раздел: Оформить заказ. Введите артикул товара.", reply_markup=BACK_MENU
-            )
-            await update.effective_message.reply_text(
-                "Подсказка: затем понадобится цвет и количество (в метрах). В конце можно добавить ещё позиции или отправить заказ."
-            )
+        if not context.user_data.get("awaiting_inn"):
+            await update.effective_message.reply_text("Выберите действие.", reply_markup=UNAUTH_MENU)
             return
-        if txt == "Визуализация штор":
-            await update.effective_message.reply_text("Раздел визуализации временно недоступен.", reply_markup=MAIN_MENU)
-            return
-        if txt == "Начать визуализацию" and context.user_data.get("viz_mode"):
-            context.user_data["viz_step"] = "choose_style"
-            await update.effective_message.reply_text("Шаг 1. Выберите стиль штор:", reply_markup=VIZ_STYLE_KB)
-            return
-        if txt == "Сделать проект":
-            context.user_data["project_mode"] = True
-            context.user_data["project_step"] = "await_room"
-            await update.effective_message.reply_text(
-                "Режим: Сделать проект. Пришлите фото комнаты (окна).", reply_markup=BACK_MENU
-            )
-            return
-        await update.effective_message.reply_text("Выберите действие в меню.", reply_markup=MAIN_MENU)
-        return
 
     # Ещё не авторизован — ждём ИНН
     if not context.user_data.get("awaiting_inn"):
@@ -587,24 +586,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     pending = storage.create_pending(update.effective_user.id, inn, email)
     link = f"https://t.me/{settings.bot_username}?start=CONFIRM_{pending.token}"
+    tg_link = f"tg://resolve?domain={settings.bot_username}&start=CONFIRM_{pending.token}"
+    code_line = f"/start CONFIRM_{pending.token}"
 
     sender: EmailSender = context.bot_data["email_sender"]
     subject = "Подтверждение авторизации в боте Компании Миранда"
     body = (
         "Здравствуйте!\n\n"
         "Вы запросили подтверждение авторизации в Telegram-боте ИИ \"Компания Миранда\".\n"
-        f"Для подтверждения перейдите по ссылке: {link}\n\n"
+        "Вариант 1 — открыть приложение Telegram по ссылке:\n"
+        f"{tg_link}\n\n"
+        "Вариант 2 — если ссылка открывается в браузере, используйте:\n"
+        f"{link}\n\n"
+        "Или отправьте боту это сообщение (скопируйте и вставьте):\n"
+        f"{code_line}\n\n"
         "Если вы не запрашивали авторизацию, просто игнорируйте это письмо."
     )
     try:
         sender.send_text(email, subject, body)
         await update.effective_message.reply_text(
-            "Мы отправили письмо со ссылкой-подтверждением на вашу почту. Проверьте, пожалуйста, email и перейдите по ссылке."
+            "Мы отправили письмо со ссылкой-подтверждением на вашу почту. Проверьте, пожалуйста, email и перейдите по ссылке.",
+            reply_markup=UNAUTH_MENU,
         )
     except Exception as e:
         logger.exception("Ошибка отправки письма: %s", e)
         await update.effective_message.reply_text(
-            "Не удалось отправить письмо на ваш email. Пожалуйста, свяжитесь с менеджером."
+            "Не удалось отправить письмо на ваш email. Пожалуйста, свяжитесь с менеджером.",
+            reply_markup=UNAUTH_MENU,
         )
 
 
@@ -665,6 +673,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("exit", cmd_exit))
+    # Общий обработчик команд, кроме /start и /exit → в handle_text
+    app.add_handler(MessageHandler(filters.COMMAND & ~filters.Regex(r"^/(start|exit)(?:\s|$)"), handle_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
